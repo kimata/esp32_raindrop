@@ -15,6 +15,7 @@
 #include "driver/i2c.h"
 #include "driver/rtc_io.h"
 #include "driver/adc.h"
+#include "driver/touch_pad.h"
 #include "lwip/sockets.h"
 
 #include "esp32/ulp.h"
@@ -48,11 +49,10 @@
 // Configuration
 #define FLUENTD_IP      "192.168.2.20"  // IP address of Fluentd
 #define FLUENTD_PORT    8888            // Port of FLuentd
-#define FLUENTD_TAG     "/test"       // Fluentd tag
+#define FLUENTD_TAG     "/sensor"       // Fluentd tag
 
-#define WIFI_HOSTNAME   "ESP32-rain"    // module's hostname
+#define WIFI_HOSTNAME   "ESP32-raindrop"    // module's hostname
 #define SENSE_INTERVAL  60              // sensing interval
-#define SENSE_BUF_COUNT 30               // buffering count
 #define SENSE_BUF_FULL  30              // full buffering count
 #define SENSE_BUF_MAX   60             // max buffering count
 
@@ -63,8 +63,9 @@ const i2c_port_t I2C_PORT       = I2C_NUM_0;
 const gpio_num_t I2C_PIN_SCL    = GPIO_NUM_26;
 const gpio_num_t I2C_PIN_SDA    = GPIO_NUM_27;
 
-const gpio_num_t GAUGE_PIN      = GPIO_NUM_25;
-const uint16_t   GAUGE_PIN_ULP  = 6;
+const touch_pad_t TOUCH_PIN     = TOUCH_PAD_NUM6;
+const uint8_t TOUCH_THRESHOLD   = 10;
+#define TOUCH_SAMPLE            5
 
 const uint8_t   HDC1010_ADR     = 0x41; // 7bit
 
@@ -76,6 +77,7 @@ const uint8_t   HDC1010_ADR     = 0x41; // 7bit
 #define WIFI_CONNECT_TIMEOUT 3
 
 typedef struct sense_data {
+    uint16_t touchpad_val;
     uint16_t battery_volt;
     float temp;
 } sense_data_t;
@@ -91,7 +93,8 @@ extern const uint8_t ulp_main_bin_end[]   asm("_binary_ulp_main_bin_end");
     "\r\n" \
     "json=%s"
 
-SemaphoreHandle_t wifi_conn_done = NULL;
+static SemaphoreHandle_t wifi_conn_done = NULL;
+static sense_data_t prev_sense_data;
 
 //////////////////////////////////////////////////////////////////////
 // Error Handling
@@ -193,7 +196,42 @@ static float hdc1010_sense()
 }
 
 //////////////////////////////////////////////////////////////////////
-// Sensor Function
+// Touch Pad Sensor Function
+int cmp_touch(const uint16_t *a, const uint16_t *b)
+{
+    if (*a < *b) {
+        return -1;
+    } else if (*a == *b) {
+        return 0;
+    } else {
+        return 1;
+    }
+}
+
+void touchpad_init()
+{
+    ESP_ERROR_CHECK(touch_pad_init());
+    ESP_ERROR_CHECK(touch_pad_config(TOUCH_PIN, 0));
+    ESP_ERROR_CHECK(touch_pad_set_voltage(TOUCH_HVOLT_2V7, TOUCH_LVOLT_0V5, TOUCH_HVOLT_ATTEN_1V));
+    ESP_ERROR_CHECK(touch_pad_filter_start(10));
+}
+
+uint16_t touchpad_sense()
+{
+    uint16_t touch_list[TOUCH_SAMPLE];
+
+    for (uint32_t i = 0; i < TOUCH_SAMPLE; i++) {
+        ESP_ERROR_CHECK(touch_pad_read_filtered(TOUCH_PIN, touch_list + i));
+    }
+
+    qsort(touch_list, TOUCH_SAMPLE, sizeof(uint16_t),
+          (int (*)(const void *, const void *))cmp_touch);
+
+    return touch_list[TOUCH_SAMPLE >> 1];
+}
+
+//////////////////////////////////////////////////////////////////////
+// Battery Voltage Sensor Function
 int cmp_volt(const uint32_t *a, const uint32_t *b)
 {
     if (*a < *b) {
@@ -233,7 +271,6 @@ static int connect_server()
 {
     struct sockaddr_in server;
     int sock;
-
     sock = socket(AF_INET, SOCK_STREAM, 0);
 
     server.sin_family = AF_INET;
@@ -249,8 +286,7 @@ static int connect_server()
     return sock;
 }
 
-static cJSON *sense_json(uint32_t battery_volt, wifi_ap_record_t *ap_info,
-                         uint32_t wifi_con_msec)
+static cJSON *sense_json(wifi_ap_record_t *ap_info, uint32_t wifi_con_msec)
 {
     sense_data_t *sense_data = (sense_data_t *)&ulp_sense_data;
 
@@ -260,6 +296,7 @@ static cJSON *sense_json(uint32_t battery_volt, wifi_ap_record_t *ap_info,
         cJSON *item = cJSON_CreateObject();
         uint32_t index = ulp_sense_count - i - 1;
 
+        cJSON_AddNumberToObject(item, "touchpad", sense_data[i].touchpad_val);
         cJSON_AddNumberToObject(item, "battery", sense_data[i].battery_volt);
         cJSON_AddNumberToObject(item, "temp", sense_data[i].temp);
         cJSON_AddStringToObject(item, "hostname", WIFI_HOSTNAME);
@@ -282,7 +319,7 @@ static cJSON *sense_json(uint32_t battery_volt, wifi_ap_record_t *ap_info,
     return root;
 }
 
-static bool process_sense_data(uint32_t battery_volt, wifi_ap_record_t *ap_info, uint32_t connect_msec)
+static bool process_sense_data(wifi_ap_record_t *ap_info, uint32_t connect_msec)
 {
     char buffer[sizeof(EXPECTED_RESPONSE)];
     bool result = false;
@@ -292,7 +329,7 @@ static bool process_sense_data(uint32_t battery_volt, wifi_ap_record_t *ap_info,
         return false;
     }
 
-    cJSON *json = sense_json(battery_volt, ap_info, connect_msec);
+    cJSON *json = sense_json(ap_info, connect_msec);
     char *json_str = cJSON_PrintUnformatted(json);
 
     do {
@@ -414,77 +451,54 @@ static void init_ulp_program()
             (ulp_main_bin_end - ulp_main_bin_start) / sizeof(uint32_t)
         )
     );
-    ulp_gpio_num = GAUGE_PIN_ULP;
-    ulp_predecessing_zero = true;
-
-    ESP_ERROR_CHECK(rtc_gpio_init(GAUGE_PIN));
-    rtc_gpio_set_direction(GAUGE_PIN, RTC_GPIO_MODE_INPUT_ONLY);
-    rtc_gpio_pulldown_en(GAUGE_PIN);
-    rtc_gpio_pullup_dis(GAUGE_PIN);
-    rtc_gpio_hold_en(GAUGE_PIN);
-
-    REG_SET_FIELD(SENS_ULP_CP_SLEEP_CYC0_REG, SENS_SLEEP_CYCLES_S0,
-                  rtc_clk_slow_freq_get_hz());
-
-    // MEMO: EDP-IDF のサンプル(ulp_example_main.c)にある下記を，
-    // 両端子共に open の手元の ESP32 に行うと消費電流がulp_set_wakeup_period増えた．詳細不明．
-    /* GPIO12: select flash voltage */
-    /* GPIO15: suppress boot messages */
-    /* rtc_gpio_isolate(GPIO_NUM_12); */
-    /* rtc_gpio_isolate(GPIO_NUM_15); */
 }
 
 //////////////////////////////////////////////////////////////////////
 // Sensing
-static bool sense_data_all_zero()
+static bool handle_touchpad_sense_data()
 {
     sense_data_t *sense_data = (sense_data_t *)&ulp_sense_data;
+    bool ret = false;
 
-    for (uint32_t i = 0; i < ulp_sense_count; i++) {
-        /* if (sense_data[i].rainfall != 0) { */
-        /*     return false; */
-        /* } */
-    }
-    return true;
-}
-
-static bool handle_ulp_sense_data()
-{
-    uint16_t edge_count;
-
-    edge_count = ulp_edge_count;
-    ulp_edge_count = 0;
-
-    sense_data_t *sense_data = (sense_data_t *)&ulp_sense_data;
-    /* sense_data[ulp_sense_count].rainfall = edge_count; */
+    touchpad_init();
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    sense_data[ulp_sense_count].touchpad_val = touchpad_sense();
     sense_data[ulp_sense_count].battery_volt = get_battery_voltage();
     sense_data[ulp_sense_count].temp = hdc1010_sense();
 
-    ulp_sense_count++;
-
-    ESP_LOGI(TAG, "SENSE_COUNT: %d / %d", ulp_sense_count, SENSE_BUF_FULL);
-    if (edge_count != 0) {
-        ESP_LOGW(TAG, "EDGE_COUNT = %d", edge_count);
+    if (sense_data[ulp_sense_count].touchpad_val == 0) {
+        if (ulp_sense_count == 0) {
+            sense_data[ulp_sense_count].touchpad_val = prev_sense_data.touchpad_val;
+        } else {
+            sense_data[ulp_sense_count].touchpad_val = sense_data[ulp_sense_count-1].touchpad_val;
+        }
     }
-
-    // check if it began to rain
-    if ((edge_count != 0) && ulp_predecessing_zero) {
-        ulp_predecessing_zero = false;
-        return true;
-    }
-    // check if it is raining and buffer is filled
-    if ((ulp_sense_count >= SENSE_BUF_COUNT) && (!sense_data_all_zero())) {
-        ulp_predecessing_zero = false;
-        return true;
+    if (ulp_sense_count == 0) {
+        if ((prev_sense_data.touchpad_val != 0) &&
+            (abs(sense_data[ulp_sense_count].touchpad_val -
+                 prev_sense_data.touchpad_val) > TOUCH_THRESHOLD)) {
+            ret = true;
+        }
+    } else {
+        if (abs(sense_data[ulp_sense_count-1].touchpad_val -
+                sense_data[ulp_sense_count].touchpad_val) > TOUCH_THRESHOLD) {
+            ret = true;
+        }
     }
 
     // check if the buffer is full
     if (ulp_sense_count >= SENSE_BUF_FULL) {
-        ulp_predecessing_zero = sense_data_all_zero();
-        return true;
+        ret = true;
     }
 
-    return false;
+    if (ret) {
+        prev_sense_data.touchpad_val = sense_data[ulp_sense_count].touchpad_val;
+    }
+    ulp_sense_count++;
+
+    ESP_LOGI(TAG, "SENSE_COUNT: %d / %d", ulp_sense_count, SENSE_BUF_FULL);
+
+    return ret;
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -492,7 +506,6 @@ void app_main()
 {
     wifi_ap_record_t ap_info;
     uint32_t time_start;
-    uint32_t battery_volt;
     uint32_t connect_msec;
 
 #ifdef ADC_CALIB_MODE
@@ -500,20 +513,17 @@ void app_main()
 #else
     vSemaphoreCreateBinary(wifi_conn_done);
 
-    battery_volt = get_battery_voltage();
-
     esp_log_level_set("wifi", ESP_LOG_ERROR);
 
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
-        if (handle_ulp_sense_data()) {
-
+        if (handle_touchpad_sense_data()) {
             bool status = false;
             ESP_LOGI(TAG, "Send to fluentd");
             time_start = xTaskGetTickCount();
 
             if (wifi_init() && wifi_connect(&ap_info)) {
                 connect_msec = (xTaskGetTickCount() - time_start) * portTICK_PERIOD_MS;
-                status = process_sense_data(battery_volt, &ap_info, connect_msec);
+                status = process_sense_data(&ap_info, connect_msec);
             }
             wifi_stop();
 
@@ -527,8 +537,7 @@ void app_main()
     } else {
         init_ulp_program();
         ulp_sense_count = 0;
-        ulp_set_wakeup_period(0, 1000*30); // 30ms
-        ESP_ERROR_CHECK(ulp_run((&ulp_entry - RTC_SLOW_MEM) / sizeof(uint32_t)));
+        prev_sense_data.touchpad_val = 0;
     }
 
     ESP_LOGI(TAG, "Go to sleep");

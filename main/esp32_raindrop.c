@@ -486,6 +486,8 @@ static bool handle_touchpad_sense_data()
         }
     }
 
+    ulp_sense_count++;
+
     // check if the buffer is full
     if (ulp_sense_count >= SENSE_BUF_FULL) {
         ret = true;
@@ -494,7 +496,6 @@ static bool handle_touchpad_sense_data()
     if (ret) {
         prev_sense_data.touchpad_val = sense_data[ulp_sense_count].touchpad_val;
     }
-    ulp_sense_count++;
 
     ESP_LOGI(TAG, "SENSE_COUNT: %d / %d", ulp_sense_count, SENSE_BUF_FULL);
 

@@ -63,7 +63,7 @@ const i2c_port_t I2C_PORT       = I2C_NUM_0;
 const gpio_num_t I2C_PIN_SCL    = GPIO_NUM_26;
 const gpio_num_t I2C_PIN_SDA    = GPIO_NUM_27;
 
-const touch_pad_t TOUCH_PIN     = TOUCH_PAD_NUM6;
+const touch_pad_t TOUCH_PIN     = TOUCH_PAD_NUM6; // GPIO14
 const uint8_t TOUCH_THRESHOLD   = 10;
 #define TOUCH_SAMPLE            5
 
@@ -77,7 +77,7 @@ const uint8_t   HDC1010_ADR     = 0x41; // 7bit
 #define WIFI_CONNECT_TIMEOUT 3
 
 typedef struct sense_data {
-    uint16_t touchpad_val;
+    int16_t touchpad_val;
     uint16_t battery_volt;
     float temp;
 } sense_data_t;
@@ -94,7 +94,6 @@ extern const uint8_t ulp_main_bin_end[]   asm("_binary_ulp_main_bin_end");
     "json=%s"
 
 static SemaphoreHandle_t wifi_conn_done = NULL;
-static sense_data_t prev_sense_data;
 
 //////////////////////////////////////////////////////////////////////
 // Error Handling
@@ -458,6 +457,7 @@ static void init_ulp_program()
 static bool handle_touchpad_sense_data()
 {
     sense_data_t *sense_data = (sense_data_t *)&ulp_sense_data;
+    sense_data_t *prev_sense_data = (sense_data_t *)&ulp_prev_sense_data;
     bool ret = false;
 
     touchpad_init();
@@ -466,22 +466,15 @@ static bool handle_touchpad_sense_data()
     sense_data[ulp_sense_count].battery_volt = get_battery_voltage();
     sense_data[ulp_sense_count].temp = hdc1010_sense();
 
-    if (sense_data[ulp_sense_count].touchpad_val == 0) {
-        if (ulp_sense_count == 0) {
-            sense_data[ulp_sense_count].touchpad_val = prev_sense_data.touchpad_val;
-        } else {
-            sense_data[ulp_sense_count].touchpad_val = sense_data[ulp_sense_count-1].touchpad_val;
-        }
-    }
     if (ulp_sense_count == 0) {
-        if ((prev_sense_data.touchpad_val != 0) &&
-            (abs(sense_data[ulp_sense_count].touchpad_val -
-                 prev_sense_data.touchpad_val) > TOUCH_THRESHOLD)) {
+        if ((prev_sense_data->touchpad_val != 0) &&
+            ((prev_sense_data->touchpad_val -
+              sense_data[ulp_sense_count].touchpad_val) > TOUCH_THRESHOLD)) {
             ret = true;
         }
     } else {
-        if (abs(sense_data[ulp_sense_count-1].touchpad_val -
-                sense_data[ulp_sense_count].touchpad_val) > TOUCH_THRESHOLD) {
+        if ((sense_data[ulp_sense_count-1].touchpad_val -
+             sense_data[ulp_sense_count].touchpad_val) > TOUCH_THRESHOLD) {
             ret = true;
         }
     }
@@ -494,7 +487,7 @@ static bool handle_touchpad_sense_data()
     }
 
     if (ret) {
-        prev_sense_data.touchpad_val = sense_data[ulp_sense_count].touchpad_val;
+        prev_sense_data->touchpad_val = sense_data[ulp_sense_count-1].touchpad_val;
     }
 
     ESP_LOGI(TAG, "SENSE_COUNT: %d / %d", ulp_sense_count, SENSE_BUF_FULL);
@@ -538,7 +531,7 @@ void app_main()
     } else {
         init_ulp_program();
         ulp_sense_count = 0;
-        prev_sense_data.touchpad_val = 0;
+        ((sense_data_t *)&ulp_prev_sense_data)->touchpad_val = 0;
     }
 
     ESP_LOGI(TAG, "Go to sleep");
